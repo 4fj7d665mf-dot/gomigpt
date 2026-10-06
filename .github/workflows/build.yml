@@ -1,0 +1,181 @@
+name: Build AffiliateMenu
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify project and payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f Makefile || {
+            echo "ERROR: Makefile not found at repository root"
+            exit 1
+          }
+
+          test -f payload.zip || {
+            echo "ERROR: payload.zip not found at repository root"
+            echo "Expected: payload.zip -> Payload/YourApp.app/..."
+            exit 1
+          }
+
+          rm -rf ci_payload
+          mkdir -p ci_payload
+          unzip -q payload.zip -d ci_payload
+
+          test -d ci_payload/Payload || {
+            echo "ERROR: payload.zip does not contain Payload/"
+            exit 1
+          }
+
+          APP_PATH="$(find ci_payload/Payload \
+            -maxdepth 1 \
+            -type d \
+            -name '*.app' \
+            -print \
+            -quit)"
+
+          test -n "$APP_PATH" || {
+            echo "ERROR: Payload/*.app not found in payload.zip"
+            exit 1
+          }
+
+          echo "Target app: $APP_PATH"
+
+      - name: Static source audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/static_audit.sh
+          ./scripts/static_audit.sh
+
+      - name: Setup Theos
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --recursive \
+            --depth 1 \
+            https://github.com/theos/theos.git \
+            "$HOME/theos"
+
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export THEOS="$HOME/theos"
+
+          make clean
+          make FINALPACKAGE=1 -j"$(sysctl -n hw.ncpu)"
+
+      - name: Locate universal dylib
+        id: dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DYLIB=""
+
+          while IFS= read -r candidate; do
+            ARCHS="$(lipo -archs "$candidate" 2>/dev/null || true)"
+
+            echo "$candidate -> $ARCHS"
+
+            if grep -qw arm64 <<<"$ARCHS" && \
+               grep -qw arm64e <<<"$ARCHS"; then
+              DYLIB="$candidate"
+              break
+            fi
+          done < <(
+            find .theos \
+              -type f \
+              -name '*.dylib' \
+              -print
+          )
+
+          test -n "$DYLIB" && test -f "$DYLIB" || {
+            echo "ERROR: universal arm64/arm64e dylib not found"
+            find .theos -type f -name '*.dylib' -print || true
+            exit 1
+          }
+
+          echo "Using dylib: $DYLIB"
+          echo "path=$DYLIB" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$DYLIB")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DYLIB='${{ steps.dylib.outputs.path }}'
+          ARCHS="$(lipo -archs "$DYLIB")"
+
+          echo "Architectures: $ARCHS"
+
+          grep -qw arm64 <<<"$ARCHS" || {
+            echo "ERROR: arm64 slice missing"
+            exit 1
+          }
+
+          grep -qw arm64e <<<"$ARCHS" || {
+            echo "ERROR: arm64e slice missing"
+            exit 1
+          }
+
+      - name: Audit linked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DYLIB='${{ steps.dylib.outputs.path }}'
+          DYLIB_NAME='${{ steps.dylib.outputs.name }}'
+
+          mkdir -p build-artifacts
+
+          otool -L "$DYLIB" \
+            | tee build-artifacts/otool-L.txt
+
+          if grep -Eiq \
+            'CydiaSubstrate|MobileSubstrate|SubstrateLoader|ElleKit|libhooker' \
+            build-artifacts/otool-L.txt
+          then
+            echo "ERROR: banned dependency detected"
+            exit 1
+          fi
+
+          cp "$DYLIB" "build-artifacts/$DYLIB_NAME"
+
+          lipo -archs \
+            "build-artifacts/$DYLIB_NAME" \
+            | tee build-artifacts/architectures.txt
+
+          shasum -a 256 \
+            "build-artifacts/$DYLIB_NAME" \
+            | tee build-artifacts/SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AffiliateMenu-build
+          path: build-artifacts/
+          if-no-files-found: error
