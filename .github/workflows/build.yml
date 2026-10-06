@@ -10,56 +10,91 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          lfs: true
 
-      - name: Verify project and payload
+      - name: Locate project
+        id: project
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f Makefile || {
-            echo "ERROR: Makefile not found at repository root"
+          echo "=== Repository contents ==="
+          find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -print | sort
+
+          MAKEFILE="$(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -name 'Makefile' \
+              ! -path '*/.theos/*' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$MAKEFILE" ]; then
+            echo "ERROR: Makefile not found anywhere in repository"
             exit 1
-          }
+          fi
 
-          test -f payload.zip || {
-            echo "ERROR: payload.zip not found at repository root"
-            echo "Expected: payload.zip -> Payload/YourApp.app/..."
-            exit 1
-          }
+          PROJECT_DIR="$(dirname "$MAKEFILE")"
 
-          rm -rf ci_payload
-          mkdir -p ci_payload
-          unzip -q payload.zip -d ci_payload
+          echo "Makefile: $MAKEFILE"
+          echo "Project directory: $PROJECT_DIR"
 
-          test -d ci_payload/Payload || {
-            echo "ERROR: payload.zip does not contain Payload/"
-            exit 1
-          }
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-          APP_PATH="$(find ci_payload/Payload \
-            -maxdepth 1 \
-            -type d \
-            -name '*.app' \
-            -print \
-            -quit)"
-
-          test -n "$APP_PATH" || {
-            echo "ERROR: Payload/*.app not found in payload.zip"
-            exit 1
-          }
-
-          echo "Target app: $APP_PATH"
-
-      - name: Static source audit
+      - name: Locate and verify payload
+        id: payload
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x scripts/static_audit.sh
-          ./scripts/static_audit.sh
+
+          PAYLOAD_ZIP=""
+
+          while IFS= read -r ZIP; do
+            echo "Checking ZIP: $ZIP"
+
+            if unzip -l "$ZIP" 2>/dev/null | grep -Eq 'Payload/[^/]+\.app/'; then
+              PAYLOAD_ZIP="$ZIP"
+              break
+            fi
+          done < <(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -iname '*.zip' \
+              -print
+          )
+
+          if [ -z "$PAYLOAD_ZIP" ]; then
+            echo "ERROR: Payload/*.app を含むZIPが見つかりません"
+            exit 1
+          fi
+
+          echo "Using payload: $PAYLOAD_ZIP"
+
+          rm -rf "$RUNNER_TEMP/payload"
+          mkdir -p "$RUNNER_TEMP/payload"
+
+          unzip -q \
+            "$PAYLOAD_ZIP" \
+            -d "$RUNNER_TEMP/payload"
+
+          APP_PATH="$(
+            find "$RUNNER_TEMP/payload/Payload" \
+              -maxdepth 1 \
+              -type d \
+              -name '*.app' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: Payload/*.app not found after extraction"
+            exit 1
+          fi
+
+          echo "App: $APP_PATH"
+          echo "app=$APP_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Setup Theos
         shell: bash
@@ -77,6 +112,34 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: Static audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR='${{ steps.project.outputs.dir }}'
+
+          cd "$PROJECT_DIR"
+
+          if [ -f scripts/static_audit.sh ]; then
+            chmod +x scripts/static_audit.sh
+            ./scripts/static_audit.sh
+          else
+            echo "No static_audit.sh found; running inline checks"
+
+            if grep -RInE \
+              --include='*.m' \
+              --include='*.mm' \
+              --include='*.h' \
+              --include='Makefile' \
+              '(%hook|%ctor|CydiaSubstrate|MobileSubstrate|SubstrateLoader|ElleKit|libhooker)' \
+              .;
+            then
+              echo "ERROR: forbidden hook/dependency reference found"
+              exit 1
+            fi
+          fi
+
       - name: Build dylib
         shell: bash
         run: |
@@ -84,43 +147,71 @@ jobs:
 
           export THEOS="$HOME/theos"
 
-          make clean
-          make FINALPACKAGE=1 -j"$(sysctl -n hw.ncpu)"
+          PROJECT_DIR='${{ steps.project.outputs.dir }}'
 
-      - name: Locate universal dylib
+          cd "$PROJECT_DIR"
+
+          echo "Building from:"
+          pwd
+
+          echo "Project files:"
+          ls -la
+
+          make clean
+
+          make \
+            FINALPACKAGE=1 \
+            -j"$(sysctl -n hw.ncpu)"
+
+      - name: Locate built dylib
         id: dylib
         shell: bash
         run: |
           set -euo pipefail
 
+          PROJECT_DIR='${{ steps.project.outputs.dir }}'
+
+          echo "Searching for built dylibs..."
+
+          find "$PROJECT_DIR/.theos" \
+            -type f \
+            -name '*.dylib' \
+            -print \
+            2>/dev/null || true
+
           DYLIB=""
 
-          while IFS= read -r candidate; do
-            ARCHS="$(lipo -archs "$candidate" 2>/dev/null || true)"
+          while IFS= read -r FILE; do
+            ARCHS="$(lipo -archs "$FILE" 2>/dev/null || true)"
 
-            echo "$candidate -> $ARCHS"
+            echo "$FILE -> $ARCHS"
 
-            if grep -qw arm64 <<<"$ARCHS" && \
-               grep -qw arm64e <<<"$ARCHS"; then
-              DYLIB="$candidate"
+            if echo "$ARCHS" | grep -qw arm64 && \
+               echo "$ARCHS" | grep -qw arm64e;
+            then
+              DYLIB="$FILE"
               break
             fi
           done < <(
-            find .theos \
+            find "$PROJECT_DIR/.theos" \
               -type f \
               -name '*.dylib' \
-              -print
+              -print \
+              2>/dev/null
           )
 
-          test -n "$DYLIB" && test -f "$DYLIB" || {
-            echo "ERROR: universal arm64/arm64e dylib not found"
-            find .theos -type f -name '*.dylib' -print || true
+          if [ -z "$DYLIB" ]; then
+            echo "ERROR: universal arm64 + arm64e dylib not found"
             exit 1
-          }
+          fi
 
-          echo "Using dylib: $DYLIB"
+          DYLIB_NAME="$(basename "$DYLIB")"
+
+          echo "Dylib: $DYLIB"
+          echo "Name: $DYLIB_NAME"
+
           echo "path=$DYLIB" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$DYLIB")" >> "$GITHUB_OUTPUT"
+          echo "name=$DYLIB_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Verify architectures
         shell: bash
@@ -128,16 +219,17 @@ jobs:
           set -euo pipefail
 
           DYLIB='${{ steps.dylib.outputs.path }}'
+
           ARCHS="$(lipo -archs "$DYLIB")"
 
           echo "Architectures: $ARCHS"
 
-          grep -qw arm64 <<<"$ARCHS" || {
+          echo "$ARCHS" | grep -qw arm64 || {
             echo "ERROR: arm64 slice missing"
             exit 1
           }
 
-          grep -qw arm64e <<<"$ARCHS" || {
+          echo "$ARCHS" | grep -qw arm64e || {
             echo "ERROR: arm64e slice missing"
             exit 1
           }
@@ -150,28 +242,30 @@ jobs:
           DYLIB='${{ steps.dylib.outputs.path }}'
           DYLIB_NAME='${{ steps.dylib.outputs.name }}'
 
-          mkdir -p build-artifacts
+          mkdir -p "$GITHUB_WORKSPACE/build-artifacts"
 
           otool -L "$DYLIB" \
-            | tee build-artifacts/otool-L.txt
+            | tee "$GITHUB_WORKSPACE/build-artifacts/otool-L.txt"
 
           if grep -Eiq \
             'CydiaSubstrate|MobileSubstrate|SubstrateLoader|ElleKit|libhooker' \
-            build-artifacts/otool-L.txt
+            "$GITHUB_WORKSPACE/build-artifacts/otool-L.txt";
           then
             echo "ERROR: banned dependency detected"
             exit 1
           fi
 
-          cp "$DYLIB" "build-artifacts/$DYLIB_NAME"
+          cp \
+            "$DYLIB" \
+            "$GITHUB_WORKSPACE/build-artifacts/$DYLIB_NAME"
 
           lipo -archs \
-            "build-artifacts/$DYLIB_NAME" \
-            | tee build-artifacts/architectures.txt
+            "$GITHUB_WORKSPACE/build-artifacts/$DYLIB_NAME" \
+            | tee "$GITHUB_WORKSPACE/build-artifacts/architectures.txt"
 
           shasum -a 256 \
-            "build-artifacts/$DYLIB_NAME" \
-            | tee build-artifacts/SHA256SUMS.txt
+            "$GITHUB_WORKSPACE/build-artifacts/$DYLIB_NAME" \
+            | tee "$GITHUB_WORKSPACE/build-artifacts/SHA256SUMS.txt"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
